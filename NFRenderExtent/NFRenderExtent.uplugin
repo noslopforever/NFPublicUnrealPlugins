@@ -1,0 +1,28 @@
+{
+	"FileVersion": 3,
+	"FriendlyName": "NFRenderExtent",
+	"Version": 1,
+	"VersionName": "1.0",
+	"CreatedBy": "noslopforever",
+	"CreatedByURL": "http://blog.csdn.net/noslopforever",
+	"Category": "NFProducts/Render",
+	"Description": "",
+	"EnabledByDefault": false,
+	"Modules": [
+        {
+            "Name": "NFRenderExtent",
+            "Type": "Developer",
+            "LoadingPhase": "Default"
+        },
+        {
+            "Name": "RESkyEngine",
+            "Type": "Runtime",
+            "LoadingPhase": "PostConfigInit"
+        },
+        {
+            "Name" : "RESkyEffects",
+            "Type": "Runtime",
+            "LoadingPhase" : "Default"
+        }
+	]
+}

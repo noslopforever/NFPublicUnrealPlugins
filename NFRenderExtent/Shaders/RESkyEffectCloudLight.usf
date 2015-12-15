@@ -1,0 +1,55 @@
+#include "RESkyEffectShaderCommon.usf"
+
+
+static float3 GCloudSampler[] = {
+	float3(1, 0, 0),
+	float3(0.5, -0.25, 0.75),
+	float3(0.5, 0.25, -0.75),
+	float3(0.5, -0.75, 0.25),
+	float3(0.5, 0.75, -0.25),
+	float3(10, 0, 0),
+};
+
+/** Cloud noise texture Read-Write
+*/
+RWTexture3D<float4> CloudLightingOcclusionTextureRW;
+
+/** Compute Cloud Noise
+*/
+[numthreads(16, 16, 1)]
+void ComputeCloudLighting(uint3 ThreadId : SV_DispatchThreadID)
+{
+	uint3 dims;
+	CloudMainNoise3DTexture.GetDimensions(dims.x,dims.y,dims.z);
+
+	// find target position
+	float3 targetPosition = ThreadId.xyz + RECloudLightingCS.StartXYZ.xyz;
+	targetPosition /= dims;
+
+	// start check pos
+	float3 startPos = targetPosition * RESkyCloudSpace.CloudZoneSize
+		+ (0.5 * RESkyCloudSpace.CloudZoneSize / dims);
+	float3 startPosInWorld = mul(float4(startPos, 1), RESkyCloudSpace.CloudToWorldMatrix).xyz;
+
+	float accumDensity = 0.0;
+	float directLight = 1.0;
+//	for (uint i = 0; i < 6; i++)
+//	{
+//		// back search
+//		float3 lightSampler = mul(float4(GCloudSampler[i], 0), RESkyLight.LightToWorld).xyz;
+//		float3 checkPos = startPosInWorld + lightSampler * RESkyLight.LightCheckStep;
+//		float density = CalcCloudDensity(checkPos, false);
+//		accumDensity += density * RESkyLight.LightCheckStep * RESkyLight.LightOcclusionResponse;	
+//	}
+
+	for (uint i = 0; i < 256; i++)
+	{
+		// back search
+		float3 checkPos = startPosInWorld + RESkyLight.LightDir * i * RESkyLight.LightCheckStep;
+		float density = CalcCloudDensity(checkPos, false);
+		accumDensity += density * RESkyLight.LightCheckStep * RESkyLight.LightOcclusionResponse;	
+	}
+
+	float4 writeColor = float4(accumDensity, accumDensity, accumDensity, accumDensity);
+	CloudLightingOcclusionTextureRW[ThreadId] = writeColor;
+}

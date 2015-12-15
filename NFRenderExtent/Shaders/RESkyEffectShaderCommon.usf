@@ -1,0 +1,340 @@
+#include "Common.usf"
+#include "AtmosphereCommon.usf"
+
+
+static const int GMainTextureSize = 128;
+static const int GDetailTextureSize = 32;
+static const float GMainTextureTexelSize = 1.0 / (float)GMainTextureSize;
+static const float GDetailTextureTexelSize = 1.0 / (float)GDetailTextureSize;
+static const float GHalfMainTextureTexelSize = 0.5 / (float)GMainTextureSize;
+static const float GHalfDetailTextureTexelSize = 0.5 / (float)GDetailTextureSize;
+// detail sampler multiplier (from main sampler)
+static const float GDetailSamplerMultiply = 157.7;
+
+#define PI      3.14159265358979323846
+#define N0      3.0e8
+#define re      7.0e-6
+#define Pf      0.51
+#define kappa   PI*N0*re*re
+#define kappa_s (1.0-Pf)*kappa
+#ifndef RAYLEIGH_BETA_FACTOR
+#	define RAYLEIGH_BETA_FACTOR (0.0596831)
+#endif
+
+
+float CalcRayleighBeta(float cos0)
+{
+	return (1.0+cos0*cos0); // Factor of (0.0596831) is applied in texture generation now.
+}
+
+float HenyeyGreenstein(float g, float cos0)
+{
+	float g2 = g * g;
+	float u = 1.0 + g2 - 2.0 * g *cos0;
+	return (1.0 - g2) * pow(abs(u), -1.5) / (4.0 * PI);
+}
+
+float3 I0(float mu, float H_v) {
+    //return exp(-kappa_s * H_v) * texture(BlurredTransp, vec2(theta / PI, kappa_s * H_v)).rgb;
+	float hg = HenyeyGreenstein(RESkyCloudStatic.CloudEccentricity, mu);
+	return H_v * hg;
+}
+
+float3 I12(float mu, float H_l, float H_v, bool reflected) {
+    //vec3 PTheta = texture(Phase1, theta / PI).rgb + texture(Phase2, theta / PI).rgb;
+	float hg = HenyeyGreenstein(RESkyCloudStatic.CloudEccentricity, mu);
+    float result;
+    if (reflected) {
+        result = (1.0 - exp(-kappa_s * (H_v + H_l))) / (H_l + H_v);
+    } else  {
+        result = (exp(-kappa_s * H_v) - exp(-kappa_s * H_l)) / (H_l - H_v);
+    }
+    return hg * H_v * result;
+}
+
+
+//
+// Layer Config and Check Config
+//
+
+/** cloud layer config
+*/
+struct RESkyCloudLayerConfig
+{
+	/** start pos 0
+	*/
+	float ZStart0;
+
+	/** start pos 1
+	*/
+	float ZStart1;
+
+	/** end pos 0
+	*/
+	float ZEnd0;
+
+	/** end pos 1
+	*/
+	float ZEnd1;
+
+	/** layer density factor
+	*/
+	float LayerDensityFactor;
+};
+
+/** cloud check config
+*/
+struct RESkyCloudCheckConfig
+{
+	/** check distance
+	*/
+	float Distance;
+
+	/** check fade value
+	*/
+	float FadeValue;
+};
+
+RESkyCloudLayerConfig GetLayerFromStaticInfo(int InIndex)
+{
+	RESkyCloudLayerConfig layer = (RESkyCloudLayerConfig)0;
+	layer.ZStart0 = RESkyCloudStatic.Layers_ZStart0[InIndex];
+	layer.ZStart1 = RESkyCloudStatic.Layers_ZStart1[InIndex];
+	layer.ZEnd0 = RESkyCloudStatic.Layers_ZEnd0[InIndex];
+	layer.ZEnd1 = RESkyCloudStatic.Layers_ZEnd1[InIndex];
+	layer.LayerDensityFactor = RESkyCloudStatic.Layers_LayerDensityFactor[InIndex];
+	return layer;
+}
+
+RESkyCloudCheckConfig GetCheckFromViewInfo(int InIndex)
+{
+	RESkyCloudCheckConfig check = (RESkyCloudCheckConfig)0;
+	check.Distance = RESkyCloudView.CloudCheck_Distance[InIndex];
+	check.FadeValue = RESkyCloudView.CloudCheck_FadeValue[InIndex];
+	return check;
+}
+
+//
+// Cloud space and World space
+//
+
+
+/** transform position from world to cloud space
+ */
+float3 CalcCloudSpacePosition(in float3 InWorldPos)
+{
+	return mul(float4(InWorldPos, 1), RESkyCloudSpace.WorldToCloudMatrix).xyz;
+}
+/** transform vector from world to cloud space
+ */
+float3 CalcCloudSpaceVector(in float3 InWorldDir)
+{
+	return mul(float4(InWorldDir, 0), RESkyCloudSpace.WorldToCloudMatrix).xyz;
+}
+
+
+
+//
+// cloud map operations
+//
+
+Texture2D CloudMap2DTexture;
+SamplerState CloudMap2DTextureSampler;
+
+/** calculate cloud map UV from Zone space
+*/
+float2 CalcCloudZoneUV(in float3 InPosition)
+{
+	float3 camPosInZone = InPosition;
+	float2 samplerUV = camPosInZone.xy / RESkyCloudSpace.CloudZoneSize;
+	return samplerUV;
+}
+
+/** get cloud map value
+ *	x : density
+ *	y : type
+ */
+float4 GetCloudMapValue(float2 InUV)
+{
+	return Texture2DSampleLevel(CloudMap2DTexture, CloudMap2DTextureSampler, InUV, 0);
+}
+
+/** get layer density from layer config
+ */
+float CalcLayerDensity(float3 InPosInZone, RESkyCloudLayerConfig InConfig)
+{
+	float z = InPosInZone.z;
+	// ----S0----S1----E0----E1----
+	if (z > InConfig.ZStart1) {
+		if (z > InConfig.ZEnd0) {
+			//  E1 < z
+			if(z > InConfig.ZEnd1) {
+				return 0;
+			}
+			// E0 < z < E1
+			float pctInZone = (z - InConfig.ZEnd0) / (InConfig.ZEnd1 - InConfig.ZEnd0);
+			return InConfig.LayerDensityFactor * (1 - saturate(pctInZone));
+		}
+		// S1 < z < E0
+		return InConfig.LayerDensityFactor;
+	}
+	// z < S0 or
+	// S0 < z < S1
+	float pctInZone = (z - InConfig.ZStart0) / (InConfig.ZStart1 - InConfig.ZStart0);
+	return InConfig.LayerDensityFactor * saturate(pctInZone);
+}
+
+/** get cloud map density
+*/
+float GetCloudMapDensity(float3 InPosInZone)
+{
+	float2 uv = CalcCloudZoneUV(InPosInZone);
+	float4 cloudMapVal = GetCloudMapValue(uv);
+	
+	// get layer and density
+	int layer = int(cloudMapVal.y);
+	
+	/// TEMP
+	layer = 0;
+	
+	if (layer < 0 || layer > 7){
+		return 0;
+	}
+	return cloudMapVal.r * CalcLayerDensity(InPosInZone, GetLayerFromStaticInfo(layer));
+}
+
+
+
+
+
+
+//
+// Main noise sampler
+//
+
+/** Calculate Cloud-space UVW from Cloud-space position
+*/
+float3 CalcCloudZoneUVW(in float3 InPosition)
+{
+	float3 camPosInZone = InPosition
+		+ float3(RESkyCloudSpace.CloudQuadOffset, 0);
+	float3 samplerUVW = camPosInZone / RESkyCloudSpace.CloudQuadSize;
+	return samplerUVW;
+}
+
+
+// 
+
+
+//
+// Cloud main noise access
+//
+/** chief noise3d texture assigned by code */
+Texture3D CloudMainNoise3DTexture;
+/** chief noise3d texture sampler assigned by code */
+SamplerState CloudMainNoise3DTextureSampler;
+
+/** fast get main texture noise value
+ * 	Automatically convert uv from 0, 0, 0 to 0.5, 0.5, 0.5
+ */
+float GetMainDensityFast(in float3 InUVW)
+{
+	//float3 acturalUVW = InUVW + float3(GHalfMainTextureTexelSize, GHalfMainTextureTexelSize, GHalfMainTextureTexelSize);
+	float3 acturalUVW = InUVW;
+	float4 mainNoise = Texture3DSampleLevel(CloudMainNoise3DTexture, CloudMainNoise3DTextureSampler, acturalUVW, 0);
+	float mainDensity =
+		(mainNoise.a)
+		+ (mainNoise.r * 0.5)
+		+ (mainNoise.g * 0.25)
+		+ (mainNoise.b * 0.125);
+
+	return mainDensity;
+}
+float GetMainDensity(in float3 InUVW)
+{
+	float3 base = floor(InUVW * GMainTextureSize);
+	float3 factor = frac(InUVW * GMainTextureSize);
+	float density000 = GetMainDensityFast((base + float3(0, 0, 0)) * GMainTextureTexelSize);
+	float density001 = GetMainDensityFast((base + float3(0, 0, 1)) * GMainTextureTexelSize);
+	float density010 = GetMainDensityFast((base + float3(0, 1, 0)) * GMainTextureTexelSize);
+	float density011 = GetMainDensityFast((base + float3(0, 1, 1)) * GMainTextureTexelSize);
+	float density100 = GetMainDensityFast((base + float3(1, 0, 0)) * GMainTextureTexelSize);
+	float density101 = GetMainDensityFast((base + float3(1, 0, 1)) * GMainTextureTexelSize);
+	float density110 = GetMainDensityFast((base + float3(1, 1, 0)) * GMainTextureTexelSize);
+	float density111 = GetMainDensityFast((base + float3(1, 0, 1)) * GMainTextureTexelSize);
+
+	float densityx00 = lerp(density000, density100, factor.x);
+	float densityx01 = lerp(density001, density101, factor.x);
+	float densityx10 = lerp(density010, density110, factor.x);
+	float densityx11 = lerp(density011, density111, factor.x);
+
+	float densityxx0 = lerp(densityx00, densityx10, factor.y);
+	float densityxx1 = lerp(densityx01, densityx11, factor.y);
+
+	float density = lerp(densityxx0, densityxx1, factor.z);
+//	density += GetMainDensityFast(InUVW + .5f * GMainTextureTexelSize * float3(1, 1, 1));
+//	density += GetMainDensityFast(InUVW + .5f * GMainTextureTexelSize * float3(-1, 1, 1));
+//	density += GetMainDensityFast(InUVW + .5f * GMainTextureTexelSize * float3(1, -1, 1));
+//	density += GetMainDensityFast(InUVW + .5f * GMainTextureTexelSize * float3(-1, -1, 1));
+//	density += GetMainDensityFast(InUVW + .5f * GMainTextureTexelSize * float3(1, 1, -1));
+//	density += GetMainDensityFast(InUVW + .5f * GMainTextureTexelSize * float3(-1, 1, -1));
+//	density += GetMainDensityFast(InUVW + .5f * GMainTextureTexelSize * float3(1, -1, -1));
+//	density += GetMainDensityFast(InUVW + .5f * GMainTextureTexelSize * float3(-1, -1, -1));
+
+//	return density;
+	return GetMainDensityFast(InUVW);
+
+}
+
+Texture3D CloudDetailNoise3DTexture;
+SamplerState CloudDetailNoise3DTextureSampler;
+
+float GetDetailDensity(in float3 InUVW)
+{
+	//float3 acturalUVW = InUVW + float3(GHalfDetailTextureTexelSize, GHalfDetailTextureTexelSize, GHalfDetailTextureTexelSize);
+	float3 acturalUVW = InUVW;
+	float4 detailNoise = Texture3DSampleLevel(CloudDetailNoise3DTexture, CloudDetailNoise3DTextureSampler, acturalUVW, 0);
+	float detailDensity = detailNoise.a
+		+ detailNoise.r * 0.5
+		+ detailNoise.g * 0.25
+		+ detailNoise.b * 0.125;
+	// TEMP factor instead
+	return detailDensity;
+}
+
+
+
+//
+// function combine
+//
+
+float CalcCloudDensity(in float3 InCloudSpacePos, bool InDetailCheck)
+{
+	// check density of cloud map
+	float densityCloudMap = GetCloudMapDensity(InCloudSpacePos);
+	
+	if (densityCloudMap > 0) {
+		float densityExtern = densityCloudMap;
+
+		// check Main noise
+		// sampler UVW is made with quad size and offset, not zone (zone is designed for limit)
+		float3 samplerUVW = CalcCloudZoneUVW(InCloudSpacePos);
+		// sample main and detail noise.
+		float densityMain = GetMainDensity(samplerUVW);
+
+		if (densityMain > 0) {
+			// detail noise
+			float densityFin = densityMain;
+			if (InDetailCheck)
+			{
+				float densityDetail = GetDetailDensity(samplerUVW * RESkyCloudSpace.DetailCloudUVMultiply);
+				//if (densityMain < 0.2) {
+				//	densityFin = saturate(densityMain * densityDetail);
+				//}
+				densityFin = saturate(densityMain - densityDetail);
+			}
+			return densityFin * densityExtern;
+		}
+	}
+	return 0;
+}

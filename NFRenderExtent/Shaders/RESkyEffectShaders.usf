@@ -1,0 +1,200 @@
+#include "RESkyEffectShaderCommon.usf"
+
+
+void SkyEffectVSMain(
+	in float2 InPosition : ATTRIBUTE0,
+	out float2 OutTexCoord : TEXCOORD0,
+	out float4 OutScreenVector : TEXCOORD1,
+	out float4 OutPosition : SV_POSITION
+	)
+{	
+	// screenspace position from vb
+	OutPosition = float4(InPosition,0,1);
+	// texture coord from vb
+	OutTexCoord = InPosition * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz;
+
+	// deproject to world space
+	OutScreenVector = mul(float4(InPosition,1,0), View.ScreenToTranslatedWorld);
+}
+
+
+Texture3D CloudLight3DTexture;
+SamplerState CloudLight3DTextureSampler;
+float4 GetLightValueFast(in float3 InUVW)
+{
+	//float3 acturalUVW = InUVW + float3(GHalfMainTextureTexelSize, GHalfMainTextureTexelSize, GHalfMainTextureTexelSize);
+	float3 acturalUVW = InUVW;
+	float4 value = Texture3DSampleLevel(CloudLight3DTexture, CloudLight3DTextureSampler, acturalUVW, 0);
+	return value;
+}
+float4 GetLightValue(in float3 InUVW)
+{
+	float3 base = floor(InUVW * GMainTextureSize);
+	float3 factor = frac(InUVW * GMainTextureSize);
+	float4 density000 = GetLightValueFast((base + float3(0, 0, 0)) * GMainTextureTexelSize);
+	float4 density001 = GetLightValueFast((base + float3(0, 0, 1)) * GMainTextureTexelSize);
+	float4 density010 = GetLightValueFast((base + float3(0, 1, 0)) * GMainTextureTexelSize);
+	float4 density011 = GetLightValueFast((base + float3(0, 1, 1)) * GMainTextureTexelSize);
+	float4 density100 = GetLightValueFast((base + float3(1, 0, 0)) * GMainTextureTexelSize);
+	float4 density101 = GetLightValueFast((base + float3(1, 0, 1)) * GMainTextureTexelSize);
+	float4 density110 = GetLightValueFast((base + float3(1, 1, 0)) * GMainTextureTexelSize);
+	float4 density111 = GetLightValueFast((base + float3(1, 0, 1)) * GMainTextureTexelSize);
+
+	float4 densityx00 = lerp(density000, density100, factor.x);
+	float4 densityx01 = lerp(density001, density101, factor.x);
+	float4 densityx10 = lerp(density010, density110, factor.x);
+	float4 densityx11 = lerp(density011, density111, factor.x);
+
+	float4 densityxx0 = lerp(densityx00, densityx10, factor.y);
+	float4 densityxx1 = lerp(densityx01, densityx11, factor.y);
+
+	float4 density = lerp(densityxx0, densityxx1, factor.z);
+//	0density = GetLightValueFast(InUVW + .5f * GMainTextureTexelSize * float3(1, 1, 1));
+//	density += GetLightValueFast(InUVW + .5f * GMainTextureTexelSize * float3(-1, 1, 1));
+//	density += GetLightValueFast(InUVW + .5f * GMainTextureTexelSize * float3(1, -1, 1));
+//	density += GetLightValueFast(InUVW + .5f * GMainTextureTexelSize * float3(-1, -1, 1));
+//	density += GetLightValueFast(InUVW + .5f * GMainTextureTexelSize * float3(1, 1, -1));
+//	density += GetLightValueFast(InUVW + .5f * GMainTextureTexelSize * float3(-1, 1, -1));
+//	density += GetLightValueFast(InUVW + .5f * GMainTextureTexelSize * float3(1, -1, -1));
+//	density += GetLightValueFast(InUVW + .5f * GMainTextureTexelSize * float3(-1, -1, -1));
+
+//	return density;
+	return GetLightValueFast(InUVW);
+}
+
+void SkyCloudMain(
+	float3 InViewPosition,
+	float3 InViewVector,
+	float InDepth,
+	out float4 OutColor
+)
+{
+	// constants in calculate
+	float mu = dot(RESkyLight.LightDir.xyz, InViewVector.xyz);
+	float hg = HenyeyGreenstein(RESkyCloudStatic.CloudEccentricity, mu);
+	//float betaRayleigh = CalcRayleighBeta(mu);
+	//float betaMie = HenyeyGreenstein(RESkyAtmosphere.HazeEccentricity, mu);
+
+	// convert to cloud space
+	float3 viewPosInZone = CalcCloudSpacePosition(InViewPosition);
+	float3 viewVecInZone = CalcCloudSpaceVector(InViewVector);
+	float3 lightDirInCloud = CalcCloudSpaceVector(RESkyLight.LightDir);
+
+	// check Z scale
+	float zScale = abs(1.0 / (viewVecInZone.z + 0.00000001));
+	// if in cloud, do not use Z scale
+	if (RESkyCloudView.ZHint == 0) {
+		zScale = 1;
+	}
+	// start point scale
+	float startScale = RESkyCloudView.ZHint * zScale;
+	float3 startPos = viewPosInZone + viewVecInZone * startScale;
+
+	float4 accumColor = float4(0, 0, 0, 1);
+	LOOP
+	for (int i = 0; i < RESkyCloudView.CheckCount; ++i)
+	{
+		RESkyCloudCheckConfig check = GetCheckFromViewInfo(i);
+		
+		float checkDistToView = check.Distance;
+		float checkFade = check.FadeValue;
+
+		if (checkDistToView > InDepth) {
+			break;
+		}
+
+		// calculate current test position
+		float3 testPos = startPos + viewVecInZone * checkDistToView * zScale;
+		// is over zone ?
+		BRANCH
+		if (testPos.x < 0
+			|| testPos.y < 0
+			|| testPos.z < 0
+			|| testPos.x > RESkyCloudSpace.CloudZoneSize.x
+			|| testPos.y > RESkyCloudSpace.CloudZoneSize.y
+			|| testPos.z > RESkyCloudSpace.CloudZoneSize.z)
+		{
+			continue;
+		}
+
+		// check density 
+		float densityFin = checkFade * CalcCloudDensity(testPos, true);
+		
+		BRANCH
+		if (densityFin > 0)
+		{
+			float3 uvw = testPos / RESkyCloudSpace.CloudZoneSize;
+
+			//float4 lightTexture = Texture3DSampleLevel(CloudLight3DTexture, CloudLight3DTextureSampler, uvw, 0);
+			float4 lightTexture = GetLightValue(uvw);
+			float lightingOcclusion = lightTexture.r;
+
+			//lightingOcclusion = 0;
+			//lightingOcclusion = max(0, 1 - lightingOcclusion);
+			//lightingOcclusion *= 0.2;
+			//lightingOcclusion = 0.2;
+
+			//
+			// lighting color
+			//
+			// triggers
+			//RESkyCloudStatic.HGResponse = 0;
+			//RESkyCloudStatic.BeerResponse = 0;
+			//RESkyCloudStatic.BeerPowderResponse = 0;
+			//RESkyCloudStatic.AmbientResponse = 0;
+
+			float3 color = float3(1, 1, 1);
+			float beer = exp(-RESkyCloudStatic.CloudLightEccentricity * lightingOcclusion);
+			float powder = 1.0 - exp(-RESkyCloudStatic.CloudLightEccentricity * lightingOcclusion * 2.0);
+
+			// HG phase function
+			float finHg = hg * RESkyCloudStatic.HGResponse;
+			// beer's Law
+			float3 beerColor = RESkyLight.LightColor * beer * RESkyCloudStatic.BeerResponse;
+			// powder color
+			float3 powderColor = float3(1, 1, 1);
+			if (RESkyCloudStatic.BeerPowderResponse != 0) {
+				powderColor = RESkyLight.LightColor * powder * RESkyCloudStatic.BeerPowderResponse;
+			}
+			// ambient
+			float3 ambientColor = RESkyAtmosphere.AmbientColor * RESkyCloudStatic.AmbientResponse;
+
+			// final
+			color = ambientColor + (powderColor * beerColor) * finHg;
+
+			//color = I0(mu, thisDensity) + I12(mu, lightingOcclusion, thisDensity, false);
+
+			//
+			// accumulate to final result
+			//
+			accumColor.rgb += color * densityFin * accumColor.a;
+			accumColor.a *= 1.0 - densityFin;
+			if (accumColor.a < 0.03) {
+				accumColor.a = 0.0;
+				break;
+			}
+		}
+	}
+
+	OutColor = accumColor;
+}
+
+
+void SkyEffectPSMain(
+	float2 TexCoord : TEXCOORD0,
+	float4 ScreenVector : TEXCOORD1,
+	out float4 OutColor : SV_Target0
+	)
+{
+	float4 cloudColor = float4(1, 1, 1, 1);
+	SkyCloudMain(View.ViewOrigin.xyz, ScreenVector.xyz, CalcSceneDepth(TexCoord), cloudColor);
+	//if (cloudColor.a > 0.99) {
+	//	discard;
+	//}
+
+	if (cloudColor.a > 0.97) {
+		discard;
+	}
+	OutColor = cloudColor;
+}
+

@@ -1,0 +1,312 @@
+//
+// FRESkyCloudLayerConfig
+//		(float, ZStart0)
+//		(float, ZStart1)
+//		(float, ZEnd0)
+//		(float, ZEnd1)
+//		(float, LayerDensityFactor)
+//
+
+//
+// FRESkyCloudCheckConfig
+//		(float, Distance)
+//		(float, FadeValue)
+//
+
+
+
+
+
+//
+// RESkyAtmosphereParameters
+//		(FVector, PlanetCenter)
+//		(float, PlanetRadius)
+//		(float, PlanetAtmosphereRadius)
+//		(FVector, AmbientColor)
+//		(float, SkyHazeEccentricity)
+//
+
+//
+// RESkyLight
+//		FMatrix LightToWorld;
+//		FMatrix WorldToLight;
+//		FVector LightDir;
+//		FVector LightColor;
+//		float LightOcclusionResponse;
+//
+
+//
+// RESkyCloudStatic
+//		(float, CloudEccentricity)
+//		(float, CloudLightEccentricity)
+//		(float, HGResponse)
+//		(float, BeerResponse)
+//		(float, BeerPowderResponse)
+//		(float, AmbientResponse)
+//		(RESkyLayerConfigurations[], Layers) -> 0~7
+//
+
+//
+// RESkyCloudSpace
+//		(FMatrix, CloudToWorldMatrix)	-> cm
+//		(FMatrix, WorldToCloudMatrix)	-> cm
+//		(FVector, CloudZoneStart)		-> cm
+//		(FVector, CloudZoneSize)		-> cm
+//		(FVector2D, CloudQuadOffset)	-> cm
+//		(FVector, CloudQuadSize)		-> cm
+//		(float, DetailCloudUVMultiply)
+//
+
+//
+// RESkyCloudView
+//		(float, CloudZoneFadeDistance)
+//		(int32, CheckCount)
+//		(RESkyCheckConfigurations[], Checks)
+//		(float, ZHint)
+//
+
+
+
+
+
+	// TEMP step
+	float InStepLength = 200.0;
+	int currentStepIndex = 0;
+
+	// final color
+	float4 accumColor = float4(0, 0, 0, 1);
+	float step = 0;
+
+	LOOP
+	while (true)
+	//for (int i = 0; i < 256 ; ++i)
+	{
+		RESkyCloudParameters.CloudZoneMaxLength = 10000000;
+
+		step += GStepLengthes[currentStepIndex];
+		if (step > InDepth
+		 || step > RESkyCloudParameters.CloudZoneMaxLength
+		 ) {
+			break;
+		}
+
+		float3 testPos = InViewPosition + InViewVector * step;
+		// is over zone ?
+		BRANCH
+		if (testPos.x < RESkyCloudParameters.CloudZoneStart.x
+			|| testPos.y < RESkyCloudParameters.CloudZoneStart.y
+			|| testPos.z < RESkyCloudParameters.CloudZoneStart.z
+			|| testPos.x > RESkyCloudParameters.CloudZoneSize.x
+			|| testPos.y > RESkyCloudParameters.CloudZoneSize.y
+			|| testPos.z > RESkyCloudParameters.CloudZoneSize.z)
+		{
+			// to upper step
+			currentStepIndex = min(RE_CLOUD_STEP_NUM - 1, currentStepIndex + 1);
+			continue;
+		}
+
+		//
+		// get main density
+		//
+
+		// sampler UVW is made with quad size and offset, not zone (zone is designed for limit)
+		float3 samplerUVW = GetCloudZoneUVW(testPos);
+		// sample main and detail noise.
+		float thisDensity = GetMainDensity(samplerUVW);
+
+		// do this check again.
+		BRANCH
+		if (thisDensity > 0
+			&& currentStepIndex > RE_CLOUD_STEP_CHECK
+			)
+		{
+			// to lowest and start again
+			// do this step again
+			step -= GStepLengthes[currentStepIndex];
+
+			// to zero
+			currentStepIndex -= RE_CLOUD_STEP_CHECK;
+			continue;
+		}
+
+		if (thisDensity > 0)
+		{
+			// detail noise
+			float detailDensity = GetDetailDensity(samplerUVW * DetailMultiply);
+			thisDensity *= detailDensity;
+		}
+
+		//
+		// try lighting
+		// current pixel's color.
+		//
+		float3 thisColor = float3(0, 0, 0);
+		BRANCH
+		if (thisDensity > 0)
+		{
+			// to lower step and do
+			currentStepIndex = max(0, currentStepIndex - 1);
+
+			//
+			// calculate lighting occlusion
+			//
+			float lightingOcclusion = 0.0f;
+			float3 localChecker = testPos;
+			float3 worldChecker = float3(0, 0, 0);
+			LOOP
+			for (int c = 1; c < RE_CLOUD_LIGHT_OCC_CHECKNUM + 1; ++c)
+			{
+				localChecker = GLightOcclusionCheckArray[c];
+				//worldChecker = testPos + 
+				//	mul(float4(localChecker, 0), RESkyAtmosphereParameters.InverseLightDirMatrix).xyz;
+
+				worldChecker = testPos + 
+					localChecker * RESkyAtmosphereParameters.LightDir;
+
+				worldChecker = testPos + float3(0, 0, c * 1000.0f);
+
+				// sampler UVW is made with quad size and offset, not zone (zone is designed for limit)
+				float3 lightSamplerUVW = GetCloudZoneUVW(worldChecker);
+
+				if (lightSamplerUVW.z <= 1 && lightSamplerUVW.z >= 0)
+				{
+					// sample main and detail noise.
+					float checkDensity = GetMainDensity(lightSamplerUVW);
+					// sample to occlusion
+					lightingOcclusion += checkDensity;
+				}
+			}
+			//lightingOcclusion = 0;
+			//lightingOcclusion = max(0, 1 - lightingOcclusion);
+			//lightingOcclusion *= 0.2;
+			//lightingOcclusion = 0.2;
+
+			//
+			// lighting color
+			//
+			float beer = exp(-0.8 * max(0, lightingOcclusion) );
+			float powder = 1.0 - exp(-lightingOcclusion * 2.0);
+
+			// triggers
+			RESkyAtmosphereParameters.HGFactor = 0;
+			//RESkyAtmosphereParameters.BeerFactor = 0;
+			RESkyAtmosphereParameters.BeerPowderFactor = 0;
+			RESkyAtmosphereParameters.AmbientFactor = 0;
+
+			// add all sub colors
+			float3 hgColor = float3(1, 1, 1);
+			if (RESkyAtmosphereParameters.HGFactor != 0) {
+				hgColor = RESkyAtmosphereParameters.LightColorUpper * HG * RESkyAtmosphereParameters.HGFactor;
+			}
+
+			float3 beerColor = RESkyAtmosphereParameters.LightColorUpper * beer * RESkyAtmosphereParameters.BeerFactor;
+
+			float3 powderColor = float3(1, 1, 1);
+			if (RESkyAtmosphereParameters.BeerPowderFactor != 0) {
+				powderColor = RESkyAtmosphereParameters.LightColorUpper * powder * RESkyAtmosphereParameters.BeerPowderFactor;
+			}
+
+			float3 ambientColor = RESkyAtmosphereParameters.AmbientColor * RESkyAtmosphereParameters.AmbientFactor;
+			thisColor = ambientColor + (powderColor * beerColor) * hgColor;
+
+			//thisColor = I0(mu, thisDensity) + I12(mu, lightingOcclusion, thisDensity, false);
+
+			//
+			// accumulate to current value
+			//
+			accumColor.rgb += thisColor * thisDensity * accumColor.a;
+			accumColor.a *= 1.0 - thisDensity;
+			if (accumColor.a < 0.03) {
+				accumColor.a = 0.0;
+				break;
+			}
+		}
+		else
+		{
+			// to upper step
+			currentStepIndex = min(RE_CLOUD_STEP_NUM - 1, currentStepIndex + 1);
+		}
+	}
+
+
+	OutColor = accumColor;
+	//OutColor.a = 1 - OutColor.a;
+	//OutColor = float4(InDepth * 0.0000000001, InDepth* 0.0000000001, InDepth* 0.0000000001, 0);
+
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+				float3 color = float3(1, 1, 1);
+			float beer = exp(-0.8 * max(0, lightingOcclusion) );
+			float powder = 1.0 - exp(-0.8 * lightingOcclusion * 2.0);
+
+			//
+			// calculate light occlusion
+			//
+			float lightingOcclusion = 0;
+			LOOP
+			for (int c = 0; c < 1; ++c)
+			{
+				float3 lightCheckPos = testPos - 256.0 * c * lightDirInCloud;
+
+				// get dest pt density
+				float lightDensity = CalcCloudDensity(lightCheckPos, false);
+				lightingOcclusion += lightDensity;
+			}
+
+			//lightingOcclusion = 0;
+			//lightingOcclusion = max(0, 1 - lightingOcclusion);
+			//lightingOcclusion *= 0.2;
+			//lightingOcclusion = 0.2;
+
+
+			//
+			// lighting color
+			//
+			// triggers
+			//RESkyCloudStatic.HGResponse = 0;
+			//RESkyCloudStatic.BeerResponse = 0;
+			//RESkyCloudStatic.BeerPowderResponse = 0;
+			//RESkyCloudStatic.AmbientResponse = 0;
+
+			// HG phase function
+			float finHg = hg * RESkyCloudStatic.HGResponse;
+			// beer's Law
+			float3 beerColor = RESkyLight.LightColor * beer * RESkyCloudStatic.BeerResponse;
+			// powder color
+			float3 powderColor = float3(1, 1, 1);
+			if (RESkyCloudStatic.BeerPowderResponse != 0) {
+				powderColor = RESkyLight.LightColor * powder * RESkyCloudStatic.BeerPowderResponse;
+			}
+			// ambient
+			float3 ambientColor = RESkyAtmosphere.AmbientColor * RESkyCloudStatic.AmbientResponse;
+
+			// final
+			color = ambientColor + (powderColor * beerColor) * finHg;
+
+			//color = I0(mu, thisDensity) + I12(mu, lightingOcclusion, thisDensity, false);
+
+			//
+			// accumulate to final result
+			//
+			accumColor.rgb += color * densityFin * accumColor.a;
+			accumColor.a *= 1.0 - densityFin;
+			if (accumColor.a < 0.03) {
+				accumColor.a = 0.0;
+				break;
+			}
+		}
